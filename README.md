@@ -1,10 +1,6 @@
 # NFL-Big-Data-Bowl-2025
 Code for my NFL Big Data Bowl 2025 Submission
 
-==================================================================================
-All code used for Ty Sayball-Wimmer's  NFL Big Data Bowl 2025 Submision.
-==================================================================================
-
 Directions:
 Download and run in order to see the results of the code. All data pertaining to this
 code needs to be downloaded first and put in the same directory, or you can change
