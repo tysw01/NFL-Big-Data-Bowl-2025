@@ -1,0 +1,262 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, roc_curve, auc, classification_report
+import xgboost as xgb
+from sklearn.preprocessing import LabelEncoder
+import matplotlib.pyplot as plt
+import shap
+
+# =======================================
+# ==== PREDICTING PLAYER OUTCOMES IN THE RED ZONE ====
+# =======================================
+
+# Load dataset
+print("Loading dataset...")
+data = pd.read_csv('final_concat_engineered_red_zone_data.csv')
+
+# Ensure numeric columns
+numeric_columns = [
+    'down', 'yardsToGo', 's', 'a', 'dis', 'dir', 'o',
+    'distanceToNearestDefender1', 'distanceToNearestDefender2',
+    'distanceToFootball', 'inMotionAtBallSnap', 'qbFacingReceiver',
+    'shiftSinceLineset', 'motionSinceLineset'
+]
+data[numeric_columns] = data[numeric_columns].apply(pd.to_numeric, errors='coerce')
+
+# Encode categorical features
+print("Encoding categorical features...")
+data['offenseFormation'] = data['offenseFormation'].fillna('Unknown')
+data['pff_manZone'] = data['pff_manZone'].fillna('Unknown')
+
+formation_encoder = LabelEncoder()
+data['offenseFormation_encoded'] = formation_encoder.fit_transform(data['offenseFormation'])
+
+manzone_encoder = LabelEncoder()
+data['pff_manZone_encoded'] = manzone_encoder.fit_transform(data['pff_manZone'])
+
+event_encoder = LabelEncoder()
+data['event_encoded'] = event_encoder.fit_transform(data['event'])
+
+# Filter for skill positions
+print("Filtering for skill positions...")
+skill_positions = ['WR', 'RB', 'TE', 'QB']
+data = data[data['position'].isin(skill_positions)]
+
+# Encode position
+position_encoder = LabelEncoder()
+data['position_encoded'] = position_encoder.fit_transform(data['position'])
+
+club_encoder = LabelEncoder()
+data['club_encoded'] = club_encoder.fit_transform(data['club'])
+
+# ==============================================================================
+# FILTERS
+data = data[data['frameType'].isin(['BEFORE_SNAP', 'SNAP'])]
+# ==============================================================================
+
+# Prepare features and target
+print("Preparing features...")
+features = [
+    'down', 'yardsToGo', 'o', 'position_encoded',
+    'distanceToNearestDefender1', 'distanceToNearestDefender2',
+    'distanceToFootball', 'inMotionAtBallSnap', 'qbFacingReceiver',
+    'shiftSinceLineset', 'motionSinceLineset', 'offenseFormation_encoded',
+    'pff_manZone_encoded', 'club_encoded', 'x', 'y', 'absoluteYardlineNumber',
+    'timeFromHuddleToLineSet', 'timeFromLineSetToSnap'
+]
+X = data[features]
+y = data['hadOutcome']
+
+# Split into train, validation, and test sets
+print("Splitting dataset...")
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42)
+X_valid, X_test, y_valid, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+# Train XGBoost model
+print("Training XGBoost model...")
+dtrain = xgb.DMatrix(X_train, label=y_train)
+dvalid = xgb.DMatrix(X_valid, label=y_valid)
+dtest = xgb.DMatrix(X_test, label=y_test)
+
+params = {
+    'objective': 'binary:logistic',
+    'eval_metric': 'logloss',
+    'max_depth': 6,         
+    'learning_rate': 0.01,    
+    'subsample': 0.8,            
+    'colsample_bytree': 0.8,     
+    'lambda': 3,                 
+    'alpha': 2,                  
+    'min_child_weight': 5,       
+    'max_delta_step': 1,      
+    'seed': 42
+}
+
+# Use early stopping with validation set to avoid overfitting
+evals = [(dtrain, 'train'), (dvalid, 'valid')]
+model = xgb.train(
+    params,
+    dtrain,
+    num_boost_round=1000,
+    evals=evals,
+    early_stopping_rounds=20,
+    verbose_eval=10
+)
+
+# Create predictions
+print("Making predictions...")
+data['predictedOutcome'] = model.predict(xgb.DMatrix(X))
+
+# Save frame-by-frame predictions
+output_file = 'dataset_with_predictions.csv'
+data.to_csv(output_file, index=False)
+print(f"Predictions saved to {output_file}")
+
+# Analyze results per play
+print("Comparing Actual vs Predicted Per Play...")
+data['uniquePlayId'] = data['gameId'].astype(str) + "_" + data['playId'].astype(str)
+
+# Add predictedAtLineset and predictedAtBallSnap
+line_set_frames = data[data['event'] == 'line_set'].groupby(['gameId', 'playId'])['frameId'].min()
+ball_snap_frames = data[data['event'] == 'ball_snap'].groupby(['gameId', 'playId'])['frameId'].min()
+
+lineset_predictions = {}
+ballsnap_predictions = {}
+
+for (game_id, play_id), play_data in data.groupby(['gameId', 'playId']):
+    lineset_frame = line_set_frames.get((game_id, play_id), None)
+    ballsnap_frame = ball_snap_frames.get((game_id, play_id), None)
+
+    if lineset_frame is not None:
+        lineset_frame_data = play_data[play_data['frameId'] == lineset_frame]
+        if not lineset_frame_data.empty:
+            max_player = lineset_frame_data.loc[lineset_frame_data['predictedOutcome'].idxmax(), 'nflId']
+            lineset_predictions[(game_id, play_id)] = max_player
+
+    if ballsnap_frame is not None:
+        ballsnap_frame_data = play_data[play_data['frameId'] == ballsnap_frame]
+        if not ballsnap_frame_data.empty:
+            max_player = ballsnap_frame_data.loc[ballsnap_frame_data['predictedOutcome'].idxmax(), 'nflId']
+            ballsnap_predictions[(game_id, play_id)] = max_player
+
+# Prepare final_results DataFrame
+final_results = pd.read_csv('predicted_and_actual_outcomes.csv')
+
+# Add predictedAtLineset and predictedAtBallSnap
+final_results['predictedAtLineset'] = final_results.apply(
+    lambda row: 1 if row['nflId'] == lineset_predictions.get((row['gameId'], row['playId']), None) else 0, axis=1
+)
+final_results['predictedAtBallSnap'] = final_results.apply(
+    lambda row: 1 if row['nflId'] == ballsnap_predictions.get((row['gameId'], row['playId']), None) else 0, axis=1
+)
+
+# Add predicted and actual positions and teams
+final_results = final_results.merge(
+    data[['gameId', 'playId', 'nflId', 'position', 'club']].drop_duplicates(),
+    on=['gameId', 'playId', 'nflId'],
+    how='left'
+).rename(columns={'position': 'predicted_position', 'club': 'predicted_team'})
+
+final_results = final_results.merge(
+    data[['gameId', 'playId', 'nflId', 'position', 'club']].drop_duplicates(),
+    left_on=['gameId', 'playId', 'actual_nflId'],
+    right_on=['gameId', 'playId', 'nflId'],
+    how='left'
+).rename(columns={'position': 'actual_position', 'club': 'actual_team'})
+
+# Drop redundant columns
+final_results = final_results.drop(columns=['nflId_y']).rename(columns={'nflId_x': 'nflId'})
+
+# Save final results
+output_file = 'predicted_and_actual_outcomes_updated.csv'
+final_results.to_csv(output_file, index=False)
+print(f"Results saved to {output_file}.")
+
+# Evaluate model
+accuracy = accuracy_score(y_test, (model.predict(dtest) > 0.5).astype(int))
+print('===== ACCURACY =====')
+print(accuracy)
+
+# Accuracy per play
+prediction_accuracy_per_play = final_results['correctPred'].mean()
+print('===== TRUE ACCURACY BY PLAY =====')
+print(prediction_accuracy_per_play)
+
+# Feature importance
+print("Feature Importance...")
+xgb.plot_importance(model, max_num_features=10)
+plt.show()
+
+# =======================================================================
+# Evaluate model
+print("Evaluating model...")
+y_pred_proba = model.predict(dtest)  # Get predicted probabilities
+y_pred_binary = (y_pred_proba > 0.5).astype(int)  # Convert probabilities to binary predictions
+
+# Calculate accuracy
+accuracy = accuracy_score(y_test, y_pred_binary)
+print(f"Test Accuracy: {accuracy:.4f}")
+
+print("Classification Report:")
+print(classification_report(y_test, y_pred_binary, target_names=['No Outcome', 'Had Outcome']))
+
+# ROC Curve
+print("Plotting ROC curve...")
+fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
+roc_auc = auc(fpr, tpr)
+plt.figure(figsize=(10, 6))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.legend(loc='lower right')
+plt.grid(True)
+plt.show()
+
+# =======================================================================
+# SHAP Analysis
+print("Explaining model with SHAP...")
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(dtest)
+shap.summary_plot(shap_values, X_test, feature_names=features)
+
+# Get the mapping of encoded values to original offensive formations
+offense_formation_mapping = dict(zip(formation_encoder.classes_, formation_encoder.transform(formation_encoder.classes_)))
+
+# Print the mapping
+print("Offensive Formation Encoding Map:")
+print(offense_formation_mapping)
+
+# Replace 'offenseFormation_encoded' with actual formation names in SHAP feature names
+shap_feature_names = features.copy()
+shap_feature_names = [feature.replace('offenseFormation_encoded', 'Offensive Formation') for feature in shap_feature_names]
+
+# Create SHAP summary plot with updated feature names
+shap.summary_plot(shap_values, X_test, feature_names=shap_feature_names)
+
+# Convert SHAP values to a DataFrame
+shap_df = pd.DataFrame(shap_values, columns=shap_feature_names)
+
+# Add the actual offensive formation names to the DataFrame
+shap_df['Offensive Formation'] = X_test['offenseFormation_encoded'].map(
+    {v: k for k, v in offense_formation_mapping.items()}
+)
+
+# Display the top formations by average SHAP value
+shap_df.groupby('Offensive Formation').mean().sort_values(by='Offensive Formation', ascending=False)
+
+# Calculate mean absolute SHAP values for offensive formations
+formation_shap_values = shap_df.groupby('Offensive Formation').mean().mean(axis=1).sort_values(ascending=False)
+
+# Plot
+plt.figure(figsize=(12, 6))
+formation_shap_values.plot(kind='bar', color='skyblue')
+plt.title('Mean Absolute SHAP Values by Offensive Formation')
+plt.xlabel('Offensive Formation')
+plt.ylabel('Mean SHAP Value')
+plt.xticks(rotation=45)
+plt.grid(True)
+plt.tight_layout()
+plt.show()
