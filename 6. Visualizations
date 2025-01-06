@@ -1,0 +1,110 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# import files
+data = pd.read_csv('dataset_with_predictions.csv')
+comparison_df = pd.read_csv('predicted_and_actual_outcomes_updated.csv')
+
+# combine gameId and playId to find a unique play
+data['uniquePlayId'] = data['gameId'].astype(str) + "_" + data['playId'].astype(str)
+
+# visualization for one play
+unique_play_id_to_visualize = data['uniquePlayId'].sample(1).iloc[0]
+single_play_data = data[data['uniquePlayId'] == unique_play_id_to_visualize]
+
+# extract the frameId for line_set and ball_snap events
+line_set_frame = single_play_data[single_play_data['event'] == 'line_set']['frameId'].min()
+ball_snap_frame = single_play_data[single_play_data['event'] == 'ball_snap']['frameId'].min()
+
+# plot predictions for each player in the play
+plt.figure(figsize=(14, 7))
+for player_id in single_play_data['nflId'].unique():
+    player_data = single_play_data[single_play_data['nflId'] == player_id]
+    week = player_data['week'].iloc[0]  # Extract the week for the legend
+    plt.plot(
+        player_data['frameId'],
+        player_data['predictedOutcome'],
+        label=f"{player_data['displayName_x'].iloc[0]} ({player_id}) - Week {week}"
+    )
+
+# add vertical lines for line_set and ball_snap
+if not np.isnan(line_set_frame):
+    plt.axvline(line_set_frame, color='blue', linestyle='--', label='Line Set')
+if not np.isnan(ball_snap_frame):
+    plt.axvline(ball_snap_frame, color='red', linestyle='--', label='Ball Snap')
+
+# add plot details
+plt.title(f'Predicted Outcome Over Time for Play {unique_play_id_to_visualize}')
+plt.xlabel('Time (0.1 seconds)')
+plt.ylabel('Predicted Outcome')
+plt.legend(title="Player", bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()
+
+# =======================================================================
+# graph to show actual vs predicted outcomes
+# Calculate actual and predicted counts
+actual_counts = comparison_df['actual_displayName'].value_counts()
+predicted_counts = comparison_df['displayName_x'].value_counts()
+
+# Create a df for scatter plot data
+scatter_data = pd.DataFrame({
+    'Player': actual_counts.index,
+    'Actual Outcomes': actual_counts.values,
+    'Predicted Outcomes': predicted_counts.reindex(actual_counts.index, fill_value=0).values
+})
+
+# add position info
+scatter_data = scatter_data.merge(
+    comparison_df[['actual_displayName', 'actual_position']].drop_duplicates(),
+    left_on='Player',
+    right_on='actual_displayName',
+    how='left'
+).drop(columns=['actual_displayName'])
+
+# create a color mapping for positions
+unique_positions = scatter_data['actual_position'].unique()
+position_colors = {pos: idx for idx, pos in enumerate(unique_positions)}
+
+# plot
+# update the scatter plot with circular markers for better aesthetics
+plt.figure(figsize=(14, 8))
+
+# scatter plot with circular markers
+for pos, color in position_colors.items():
+    subset = scatter_data[scatter_data['actual_position'] == pos]
+    plt.scatter(
+        subset['Actual Outcomes'],
+        subset['Predicted Outcomes'],
+        label=pos,
+        s=50,  # marker size
+        marker='o',
+        edgecolor='black',  # circle marker outline
+        alpha=0.8  # transparency
+    )
+
+# reduce overlap (did not help)
+for _, row in scatter_data.iterrows():
+    plt.text(
+        row['Actual Outcomes'] + 0.3,
+        row['Predicted Outcomes'] + 0.3,
+        row['Player'],
+        fontsize=8,
+        alpha=0.7
+    )
+
+# add identity line (y = x)
+max_val = max(scatter_data['Actual Outcomes'].max(), scatter_data['Predicted Outcomes'].max())
+plt.plot([0, max_val], [0, max_val], color='red', linestyle='--', label='Identity Line (y = x)')
+
+# labels
+plt.title('Scatter Plot of Actual vs Predicted Outcomes per Player', fontsize=14)
+plt.xlabel('Total Outcomes', fontsize=12)
+plt.ylabel('Total Predicted Outcomes', fontsize=12)
+plt.legend(title='Actual Position', loc='upper left', fontsize=10)
+plt.grid(alpha=0.3)
+
+plt.show()
+
+# ======================================================================
