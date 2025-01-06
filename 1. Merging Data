@@ -1,0 +1,58 @@
+import numpy as np
+import pandas as pd
+
+# load datasets
+plays = pd.read_csv('plays.csv')
+players = pd.read_csv('players.csv')
+player_play = pd.read_csv('player_play.csv')
+games = pd.read_csv('games.csv')
+tracking_data = pd.read_csv('tracking_week_9.csv')
+
+# merge tracking data w plays to get playDirection w play-level details
+tracking_plays_merged = pd.merge(
+    tracking_data,
+    plays[['gameId', 'playId', 'absoluteYardlineNumber', 'down', 'yardsToGo', 'offenseFormation', 'pff_manZone']],
+    on=['gameId', 'playId'],
+    how='inner'
+)
+
+# filter for red zone plays using playDirection and absoluteYardlineNumber
+red_zone_plays = tracking_plays_merged[
+    ((tracking_plays_merged['playDirection'] == 'right') & (tracking_plays_merged['absoluteYardlineNumber'] >= 90)) |
+    ((tracking_plays_merged['playDirection'] == 'left') & (tracking_plays_merged['absoluteYardlineNumber'] <= 30))
+]
+
+# If wanting to filter by non red zone plays
+'''
+red_zone_plays = tracking_plays_merged[
+    ((tracking_plays_merged['absoluteYardlineNumber'] >= 30) & (tracking_plays_merged['absoluteYardlineNumber'] <= 90))
+]'''
+# merge with player-level performance data
+red_zone_player_data = pd.merge(
+    red_zone_plays,
+    player_play,
+    on=['gameId', 'playId', 'nflId'],
+    how='left'
+)
+
+# merge with player details
+red_zone_player_data = pd.merge(
+    red_zone_player_data,
+    players[['nflId', 'position', 'displayName']],
+    on='nflId',
+    how='left'
+)
+
+# merge with game-level details
+final_red_zone_data = pd.merge(
+    red_zone_player_data,
+    games[['gameId', 'season', 'week']],
+    on='gameId',
+    how='left'
+)
+
+# save
+final_red_zone_data.to_csv('merged_red_zone_data9.csv', index=False)
+
+# display sample
+print(final_red_zone_data.head())
