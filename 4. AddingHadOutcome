@@ -1,0 +1,82 @@
+import numpy as np
+import pandas as pd
+
+# import concat file
+input_file = 'concatenated_engineered_red_zone_data.csv'
+data = pd.read_csv(input_file)
+
+# drop unwanted columns to reduce file size
+print('Dropping Columns...')
+columns_to_drop = [
+    'jerseyNumber',
+    'fumbles',
+    'fumbleLost',
+    'fumbleOutOfBounds',
+    'assistedTackle',
+    'forcedFumbleAsDefense',
+    'halfSackYardsAsDefense',
+    'passDefensed',
+    'sackYardsAsDefense',
+    'safetyAsDefense',
+    'soloTackle',
+    'tackleAssist',
+    'tackleForALoss',
+    'hadInterception',
+    'interceptionYards',
+    'fumbleRecoveries',
+    'fumbleRecoveryYards',
+    'penaltyYards',
+    'wasInitialPassRusher',
+    'getOffTimeAsPassRusher',
+    'blockedPlayerNFLId1',
+    'blockedPlayerNFLId2',
+    'blockedPlayerNFLId3',
+    'pressureAllowedAsBlocker',
+    'timeToPressureAllowedAsBlocker',
+]
+
+# drop columns in the list
+data = data.drop(columns=columns_to_drop)
+
+# ===================================================================================
+# DELETE IF FUCKED UP
+
+# List of events of interest
+events_of_interest = [
+    'dropped_pass',
+    'handoff',
+    'pass_outcome_caught',
+    'pass_outcome_incomplete',
+    'pass_outcome_interception',
+    'pass_outcome_touchdown',
+    'pass_arrived',
+    'run'
+]  # Replace with your actual event names
+
+# Function to filter frames for each play
+def filter_frames_after_event(group):
+    # Find the first frame where any of the specified events occur
+    event_frame = group[group['event'].isin(events_of_interest)]['frameId'].min()
+
+    # If no such frame exists, keep all frames
+    if pd.isna(event_frame):
+        return group
+
+    # Otherwise, filter out frames occurring after the event frame
+    return group[group['frameId'] <= event_frame]
+
+
+# Apply the function to the dataset grouped by play
+filtered_data = data.groupby(['gameId', 'playId'], group_keys=False).apply(filter_frames_after_event)
+
+# Check the shape and save the filtered dataset
+print(f"Original dataset shape: {data.shape}")
+print(f"Filtered dataset shape: {filtered_data.shape}")
+# ===================================================================================
+
+# adding if a player had either a reception or rush attempt
+# this determines if a player had an outcome on the play
+print('Calculating Outcomes...')
+filtered_data['hadOutcome'] = ((filtered_data['hadRushAttempt'].fillna(0) + filtered_data['hadPassReception'].fillna(0)) >= 1).astype(int)
+
+filtered_data.to_csv('final_concat_engineered_red_zone_data.csv')
