@@ -1,0 +1,196 @@
+import pandas as pd
+from scipy.spatial.distance import euclidean
+import numpy as np
+import math
+
+# load merged red zone data
+input_file = 'merged_red_zone_data1.csv'
+output_file = 'engineered_red_zone_data1.csv'
+
+print("Loading merged red zone data...")
+data = pd.read_csv(input_file)
+
+# ensure numeric types for calculations
+numeric_columns = ['x', 'y', 'frameId', 's', 'dir', 'o']
+data[numeric_columns] = data[numeric_columns].apply(pd.to_numeric, errors='coerce')
+
+# label for adding motion indicators
+print("Adding motion indicators...")
+
+def calculate_shift_distance(group):
+    first_pos = group.iloc[0][['x', 'y']]
+    last_pos = group.iloc[-1][['x', 'y']]
+    return euclidean(first_pos, last_pos)
+
+data['shiftDistance'] = (
+    data.groupby(['gameId', 'playId', 'nflId'])
+    .apply(calculate_shift_distance)
+    .reset_index(level=[0, 1, 2], drop=True)
+)
+
+data['shiftSinceLineset'] = (data['shiftDistance'] > 2.5)
+
+def was_in_motion(group):
+    recent_frames = group[group['frameId'] == group['frameId'].max()]
+    return any((recent_frames['s'] > 0.62) & (recent_frames['shiftSinceLineset']))
+
+data['inMotionAtBallSnap'] = (
+    data.groupby(['gameId', 'playId', 'nflId'])
+    .apply(was_in_motion)
+    .reset_index(level=[0, 1, 2], drop=True)
+)
+
+# calculate time differences between pre-snap events
+print("Calculating timing metrics...")
+
+def calculate_time_differences(group):
+    snap_frame = group[group['event'] == 'ball_snap']['frameId']
+    huddle_break_frame = group[group['event'] == 'huddle_break_offense']['frameId']
+    line_set_frame = group[group['event'] == 'line_set']['frameId']
+
+    snap_frame = snap_frame.iloc[0] if not snap_frame.empty else np.nan
+    huddle_break_frame = huddle_break_frame.iloc[0] if not huddle_break_frame.empty else np.nan
+    line_set_frame = line_set_frame.iloc[0] if not line_set_frame.empty else np.nan
+
+    return pd.Series({
+        'timeFromHuddleToLineSet': (line_set_frame - huddle_break_frame) * 0.1 if not pd.isna(huddle_break_frame) and not pd.isna(line_set_frame) else np.nan,
+        'timeFromLineSetToSnap': (snap_frame - line_set_frame) * 0.1 if not pd.isna(line_set_frame) and not pd.isna(snap_frame) else np.nan,
+    })
+
+time_differences = (
+    data.groupby(['gameId', 'playId'])
+    .apply(calculate_time_differences)
+    .reset_index()
+)
+
+data = pd.merge(data, time_differences, on=['gameId', 'playId'], how='left')
+
+# calculate distances to the two nearest defenders
+print("Calculating distances to nearest defenders...")
+
+def calculate_nearest_defenders(group):
+    distances_to_defenders = []
+    for idx, row in group.iterrows():
+        if row['teamAbbr'] == row['club']:  # offensive player
+            offensive_player_pos = (row['x'], row['y'])
+            defenders = group[group['teamAbbr'] != row['teamAbbr']][['x', 'y']]
+            if not defenders.empty:
+                all_distances = defenders.apply(lambda d: euclidean(offensive_player_pos, (d['x'], d['y'])), axis=1)
+                nearest_distances = sorted(all_distances)[:2]  # get two nearest distances
+                distances_to_defenders.append(nearest_distances)
+            else:
+                distances_to_defenders.append([np.nan, np.nan])
+        else:
+            distances_to_defenders.append([np.nan, np.nan])
+    return pd.DataFrame(distances_to_defenders, columns=['distanceToNearestDefender1', 'distanceToNearestDefender2'], index=group.index)
+
+nearest_defender_distances = (
+    data.groupby(['gameId', 'playId', 'frameId'])
+    .apply(calculate_nearest_defenders)
+    .reset_index(level=[0, 1, 2], drop=True)
+)
+
+data = pd.concat([data, nearest_defender_distances], axis=1)
+
+# calculate distances to football
+print("Calculating distances to the football...")
+
+# Corrected function to calculate distance to the football
+def calculate_distance_to_football(group):
+    football_pos = group[group['nflId'].isnull()][['x', 'y']].values
+    if len(football_pos) == 0:
+        return pd.Series([np.nan] * len(group), index=group.index)  # Return a Series with NaN if no football found
+
+    football_pos = football_pos[0]
+    distances = group.apply(lambda row: euclidean((row['x'], row['y']), football_pos), axis=1)
+    return distances  # Return distances as a Series
+
+data['distanceToFootball'] = (
+    data.groupby(['gameId', 'playId', 'frameId'])
+    .apply(calculate_distance_to_football)
+    .reset_index(level=[0, 1, 2], drop=True)
+)
+
+# qb orientation feature
+print("Calculating QB orientation towards receivers...")
+
+def calculate_angle(qb, target):
+    dx = target['x'] - qb['x']
+    dy = target['y'] - qb['y']
+    angle_to_target = math.degrees(math.atan2(dy, dx))
+    return angle_to_target
+
+def is_qb_facing(qb_orientation, angle_to_target, threshold=45):
+    angle_diff = (qb_orientation - angle_to_target + 360) % 360
+    angle_diff = min(angle_diff, 360 - angle_diff)
+    return angle_diff <= threshold
+
+def add_qb_facing_features(group):
+    qb = group[group['position'] == 'QB']
+    if qb.empty:
+        return pd.DataFrame()  # return empty if no QB (shouldn't happen)
+    qb = qb.iloc[0]
+    skill_players = group[group['position'].isin(['WR', 'RB', 'TE'])]
+    results = []
+    for _, player in skill_players.iterrows():
+        angle_to_player = calculate_angle(qb, player)
+        facing = is_qb_facing(qb['o'], angle_to_player)
+        results.append({
+            'gameId': qb['gameId'],
+            'playId': qb['playId'],
+            'frameId': qb['frameId'],
+            'nflId': player['nflId'],
+            'qbFacingReceiver': facing
+        })
+    return pd.DataFrame(results)
+
+qb_facing_features = (
+    data.groupby(['gameId', 'playId', 'frameId'])
+    .apply(add_qb_facing_features)
+    .reset_index(drop=True)
+)
+
+data = pd.merge(data, qb_facing_features, on=['gameId', 'playId', 'frameId', 'nflId'], how='left')
+
+# add possession column
+print("Determining possession...")
+
+def determine_possession(group):
+    # initialize possession as false for all players
+    group['hasPossession'] = False
+
+    # identify football
+    football_row = group[group['nflId'].isna()]
+    if football_row.empty:
+        print(f"No football found in frameId {group['frameId'].iloc[0]} for playId {group['playId'].iloc[0]}")
+        return group  # skip this frame if football is missing (again, shouldn't be)
+
+    # get football's position
+    football_pos = football_row.iloc[0][['x', 'y']].values
+
+    # calculate distances to football for all players
+    group['distanceToFootball'] = group.apply(lambda row: euclidean((row['x'], row['y']), football_pos), axis=1)
+
+    # sort by distance and select closest player
+    sorted_group = group[group['nflId'].notna()].sort_values('distanceToFootball')
+    if sorted_group.empty:
+        print(f"No players found near football in frameId {group['frameId'].iloc[0]}")
+        return group
+
+    closest_player = sorted_group.iloc[0]  #closest player
+
+    # assign possession to the closest player
+    group.loc[group['nflId'] == closest_player['nflId'], 'hasPossession'] = True
+
+    return group
+
+data = (
+    data.groupby(['gameId', 'playId', 'frameId'])
+    .apply(determine_possession)
+    .reset_index(drop=True)
+)
+
+# save engineered dataset
+print("Saving engineered dataset...")
+data.to_csv(output_file, index=False)
+print(f"Feature engineering complete. Data saved to {output_file}.")
